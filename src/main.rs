@@ -1,26 +1,32 @@
-//! Blinks the LED on a Pico board
-//!
-//! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
+//! Converts characters from a serial connection (baud rate 8000) into morse code
+//! and then plays it through the buzzer.
+//! Uses GPIO18 for the buzzer.
 #![no_std]
 #![no_main]
 
 use bsp::entry;
+use bsp::hal::{
+    clocks::{init_clocks_and_plls, Clock},
+    pac, pwm,
+    sio::Sio,
+    watchdog::Watchdog,
+    Timer,
+};
 use defmt::*;
 use defmt_rtt as _;
-use embedded_hal::digital::v2::OutputPin;
+use embedded_hal::PwmPin;
 use panic_probe as _;
-
 // Provide an alias for our BSP so we can switch targets quickly.
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
 use rp_pico as bsp;
-// use sparkfun_pro_micro_rp2040 as bsp;
+use usb_device::{class_prelude::*, prelude::*};
+use usbd_serial::SerialPort;
 
-use bsp::hal::{
-    clocks::{init_clocks_and_plls, Clock},
-    pac,
-    sio::Sio,
-    watchdog::Watchdog,
-};
+use crate::morse::MorseCode;
+
+mod morse;
+
+// use sparkfun_pro_micro_rp2040 as bsp;
 
 #[entry]
 fn main() -> ! {
@@ -53,21 +59,63 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    // This is the correct pin on the Raspberry Pico board. On other boards, even if they have an
-    // on-board LED, it might need to be changed.
-    // Notably, on the Pico W, the LED is not connected to any of the RP2040 GPIOs but to the cyw43 module instead. If you have
-    // a Pico W and want to toggle a LED with a simple GPIO output pin, you can connect an external
-    // LED to one of the GPIO pins, and reference that pin here.
-    let mut led_pin = pins.led.into_push_pull_output();
+    let usb_bus = UsbBusAllocator::new(bsp::hal::usb::UsbBus::new(
+        pac.USBCTRL_REGS,
+        pac.USBCTRL_DPRAM,
+        clocks.usb_clock,
+        true,
+        &mut pac.RESETS,
+    ));
+
+    // Set up the USB Communications Class Device driver
+    let mut serial = SerialPort::new(&usb_bus);
+
+    // Create a USB device with a fake VID and PID
+    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x54aa, 0xfa2d))
+        .manufacturer("Miam Inc.")
+        .product("Serial port")
+        .serial_number("TEST")
+        .device_class(2) // from: https://www.usb.org/defined-class-codes
+        .build();
+
+    // Init PWMs
+    let mut pwm_slices = pwm::Slices::new(pac.PWM, &mut pac.RESETS);
+
+    // Configure PWM1
+    let pwm = &mut pwm_slices.pwm1;
+    pwm.set_ph_correct();
+    pwm.enable();
+
+    let channel = &mut pwm.channel_a;
+    channel.output_to(pins.gpio18);
+    channel.set_duty(morse::TONE);
+    channel.disable();
+
+    let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
+    let mut said_hello = false;
 
     loop {
-        info!("on!");
-        led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-        info!("off!");
-        led_pin.set_low().unwrap();
-        delay.delay_ms(500);
+        if !said_hello && timer.get_counter().ticks() >= 2_000_000 {
+            said_hello = true;
+            let _ = serial.write(b"Welcome to tiny morse, please enter your text so it can be transformed into morse code!\r\n");
+            info!("Sent serial welcome message");
+        }
+        // Check for new data
+        if usb_dev.poll(&mut [&mut serial]) {
+            let mut buf = [0u8; 64];
+            match serial.read(&mut buf) {
+                Err(_) | Ok(0) => {
+                    // Do nothing
+                }
+                Ok(count) => {
+                    let mut morse = MorseCode::new(&buf[..count], channel);
+                    while let Some(character) = morse.get_char() {
+                        info!("Playing tone for character: {}", character);
+                        morse.consume_tone(&mut delay);
+                        delay.delay_ms(3 * morse::UNIT)
+                    }
+                }
+            }
+        }
     }
 }
-
-// End of file
